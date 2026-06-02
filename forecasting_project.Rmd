@@ -1,0 +1,523 @@
+---
+title: "TÜİK Forecasting Project: Health Expenditures"
+author: "Burak Kara"
+output: html_document
+---
+
+# 1. Project Overview
+
+This project develops an R-based forecasting analysis using a time series data set obtained from the TÜİK Data Portal.
+
+The selected data set is **Health Expenditures** under the **Health and Social Protection** theme. The selected variable is **Total Health Expenditure - General Total**, measured in **million TRY**.
+
+The purpose of the project is to forecast the next available annual period after the latest TÜİK observation.
+
+# 2. Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tuikr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+library(readxl)
+library(httr)
+library(forecast)
+library(knitr)
+library(readr)
+library(scales)
+```
+
+# 3. TÜİK Data Source Information
+
+- TÜİK data set name: Health Expenditures
+- TÜİK theme/category: Health and Social Protection
+- TÜİK table name: Health Expenditures
+- Data access method: `tuikr::statistical_tables("12")` table URL and `httr::GET()`
+- tuikr dataflow ID: NA - istab table accessed via `tuikr::statistical_tables("12")` table_url
+- Selected variable: Total Health Expenditure - General Total
+- Unit: Million TRY
+- Data frequency: Annual
+- Time coverage: 1999 / 2024
+- Latest available observation: 2024
+- Forecast target period: 2025
+
+# 4. Data Access Through tuikr
+
+```{r data-access}
+health_all <- statistical_tables("12")
+
+selected_table <- health_all %>%
+  filter(node_type == "istab") %>%
+  filter(grepl("^Health\\s+Expenditures$", table_name)) %>%
+  slice(1)
+
+selected_table %>%
+  select(theme_name, table_name, node_type, table_url) %>%
+  kable()
+```
+
+```{r download-data}
+file_url <- selected_table$table_url[1]
+
+response <- httr::GET(
+  file_url,
+  httr::add_headers(
+    "User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+    "Accept" = "application/vnd.ms-excel, application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/octet-stream, */*",
+    "Referer" = "https://veriportali.tuik.gov.tr/"
+  )
+)
+
+httr::status_code(response)
+```
+
+```{r read-raw-data}
+temp_file <- tempfile(fileext = ".xls")
+
+writeBin(
+  httr::content(response, "raw"),
+  temp_file
+)
+
+raw_health <- readxl::read_excel(temp_file)
+
+head(raw_health)
+```
+
+# 5. Data Cleaning and Time Series Preparation
+
+```{r clean-data}
+first_col <- names(raw_health)[1]
+value_col <- names(raw_health)[3]
+
+health_expenditure_annual <- raw_health %>%
+  mutate(
+    row_text = .data[[first_col]],
+    detected_year = stringr::str_extract(row_text, "\\b(19|20)\\d{2}\\b")
+  ) %>%
+  tidyr::fill(detected_year, .direction = "down") %>%
+  filter(row_text == "Total health expenditure") %>%
+  transmute(
+    year = as.integer(detected_year),
+    health_expenditure_million_try = as.numeric(
+      stringr::str_replace_all(.data[[value_col]], "[^0-9.]", "")
+    )
+  ) %>%
+  filter(!is.na(year), !is.na(health_expenditure_million_try)) %>%
+  arrange(year)
+
+health_expenditure_annual %>%
+  kable()
+```
+
+```{r time-series-object}
+health_ts <- ts(
+  health_expenditure_annual$health_expenditure_million_try,
+  start = min(health_expenditure_annual$year),
+  frequency = 1
+)
+
+latest_year <- max(health_expenditure_annual$year)
+forecast_target_year <- latest_year + 1
+
+latest_year
+forecast_target_year
+```
+
+# 6. Exploratory Time Series Analysis
+
+```{r actual-series-plot}
+dir.create("outputs", showWarnings = FALSE)
+dir.create("outputs/tables", recursive = TRUE, showWarnings = FALSE)
+dir.create("outputs/figures", recursive = TRUE, showWarnings = FALSE)
+
+actual_plot <- ggplot(health_expenditure_annual, aes(x = year, y = health_expenditure_million_try)) +
+  geom_line(linewidth = 1) +
+  geom_point() +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Total Health Expenditure in Türkiye",
+    x = "Year",
+    y = "Million TRY"
+  )
+
+actual_plot
+
+ggsave(
+  filename = "outputs/figures/actual_series_plot.png",
+  plot = actual_plot,
+  width = 8,
+  height = 5
+)
+```
+
+The selected series shows a strong upward trend over time. Since the data are annual, recurring monthly or quarterly seasonality cannot be evaluated. Therefore, seasonal forecasting methods are not applicable to this selected time series.
+
+# 7. Forecast Accuracy Function
+
+```{r accuracy-function}
+calculate_accuracy <- function(actual, forecast) {
+  error <- actual - forecast
+  mad <- mean(abs(error), na.rm = TRUE)
+  rsfe <- sum(error, na.rm = TRUE)
+  
+  tibble(
+    Bias = mean(error, na.rm = TRUE),
+    MAD = mad,
+    MSE = mean(error^2, na.rm = TRUE),
+    MAPE = mean(abs(error / actual), na.rm = TRUE) * 100,
+    RSFE = rsfe,
+    Tracking_Signal = rsfe / mad
+  )
+}
+```
+
+# 8. Forecasting Methods
+
+The following applicable methods are used:
+
+- Naïve Forecasting
+- Moving Average
+- Weighted Moving Average
+- Exponential Smoothing
+- Trend-Adjusted Exponential Smoothing
+- Linear Trend Projection
+
+Since the selected data are annual, the following methods are not applicable:
+
+- Seasonal Indices
+- Additive Decomposition
+- Multiplicative Decomposition
+- Regression with Trend and Seasonal Dummy Variables
+
+```{r rolling-forecasts}
+years <- health_expenditure_annual$year
+values <- health_expenditure_annual$health_expenditure_million_try
+
+min_train <- 10
+eval_index <- (min_train + 1):length(values)
+
+actual_eval <- values[eval_index]
+year_eval <- years[eval_index]
+
+forecast_naive <- c()
+forecast_ma <- c()
+forecast_wma <- c()
+forecast_ses <- c()
+forecast_holt <- c()
+forecast_trend <- c()
+
+for (i in eval_index) {
+  train_values <- values[1:(i - 1)]
+  train_ts <- ts(train_values, start = years[1], frequency = 1)
+  
+  forecast_naive <- c(forecast_naive, tail(train_values, 1))
+  
+  forecast_ma <- c(forecast_ma, mean(tail(train_values, 3)))
+  
+  forecast_wma <- c(
+    forecast_wma,
+    sum(tail(train_values, 3) * c(0.2, 0.3, 0.5))
+  )
+  
+  forecast_ses <- c(
+    forecast_ses,
+    as.numeric(forecast::ses(train_ts, h = 1)$mean[1])
+  )
+  
+  forecast_holt <- c(
+    forecast_holt,
+    as.numeric(forecast::holt(train_ts, h = 1)$mean[1])
+  )
+  
+  trend_df <- data.frame(
+    y = train_values,
+    t = seq_along(train_values)
+  )
+  
+  trend_model <- lm(y ~ t, data = trend_df)
+  
+  forecast_trend <- c(
+    forecast_trend,
+    as.numeric(predict(trend_model, newdata = data.frame(t = length(train_values) + 1)))
+  )
+}
+
+forecast_results <- tibble(
+  year = year_eval,
+  actual = actual_eval,
+  Naive = forecast_naive,
+  Moving_Average = forecast_ma,
+  Weighted_Moving_Average = forecast_wma,
+  Exponential_Smoothing = forecast_ses,
+  Trend_Adjusted_Exponential_Smoothing = forecast_holt,
+  Linear_Trend_Projection = forecast_trend
+)
+
+forecast_results %>%
+  kable()
+```
+
+# 9. Next-Period Forecasts
+
+```{r next-period-forecasts}
+full_ts <- ts(values, start = years[1], frequency = 1)
+
+next_naive <- tail(values, 1)
+next_ma <- mean(tail(values, 3))
+next_wma <- sum(tail(values, 3) * c(0.2, 0.3, 0.5))
+next_ses <- as.numeric(forecast::ses(full_ts, h = 1)$mean[1])
+next_holt <- as.numeric(forecast::holt(full_ts, h = 1)$mean[1])
+
+full_trend_df <- data.frame(
+  y = values,
+  t = seq_along(values)
+)
+
+full_trend_model <- lm(y ~ t, data = full_trend_df)
+
+next_trend <- as.numeric(
+  predict(full_trend_model, newdata = data.frame(t = length(values) + 1))
+)
+
+next_forecasts <- tibble(
+  Method = c(
+    "Naive Forecasting",
+    "Moving Average",
+    "Weighted Moving Average",
+    "Exponential Smoothing",
+    "Trend-Adjusted Exponential Smoothing",
+    "Linear Trend Projection"
+  ),
+  Next_Period_Forecast = c(
+    next_naive,
+    next_ma,
+    next_wma,
+    next_ses,
+    next_holt,
+    next_trend
+  )
+)
+
+next_forecasts %>%
+  kable()
+```
+
+# 10. Accuracy Comparison
+
+```{r accuracy-comparison}
+accuracy_comparison <- bind_rows(
+  calculate_accuracy(actual_eval, forecast_naive) %>%
+    mutate(Method = "Naive Forecasting"),
+  calculate_accuracy(actual_eval, forecast_ma) %>%
+    mutate(Method = "Moving Average"),
+  calculate_accuracy(actual_eval, forecast_wma) %>%
+    mutate(Method = "Weighted Moving Average"),
+  calculate_accuracy(actual_eval, forecast_ses) %>%
+    mutate(Method = "Exponential Smoothing"),
+  calculate_accuracy(actual_eval, forecast_holt) %>%
+    mutate(Method = "Trend-Adjusted Exponential Smoothing"),
+  calculate_accuracy(actual_eval, forecast_trend) %>%
+    mutate(Method = "Linear Trend Projection")
+) %>%
+  left_join(next_forecasts, by = "Method") %>%
+  select(
+    Method,
+    Bias,
+    MAD,
+    MSE,
+    MAPE,
+    RSFE,
+    Tracking_Signal,
+    Next_Period_Forecast
+  )
+
+not_applicable_methods <- tibble(
+  Method = c(
+    "Seasonal Indices",
+    "Additive Decomposition",
+    "Multiplicative Decomposition",
+    "Regression with Trend and Seasonal Dummy Variables"
+  ),
+  Bias = NA_real_,
+  MAD = NA_real_,
+  MSE = NA_real_,
+  MAPE = NA_real_,
+  RSFE = NA_real_,
+  Tracking_Signal = NA_real_,
+  Next_Period_Forecast = NA_real_
+)
+
+accuracy_comparison_full <- bind_rows(
+  accuracy_comparison,
+  not_applicable_methods
+)
+
+accuracy_comparison_full %>%
+  kable(digits = 2)
+
+readr::write_csv(
+  accuracy_comparison_full,
+  "outputs/tables/accuracy_comparison.csv"
+)
+```
+
+
+# 11. Actual vs Forecast Plots
+
+```{r plot-functions}
+plot_forecast_method <- function(method_column, method_name, filename) {
+  plot_data <- forecast_results %>%
+    select(year, actual, forecast = all_of(method_column)) %>%
+    tidyr::pivot_longer(
+      cols = c(actual, forecast),
+      names_to = "series",
+      values_to = "value"
+    )
+  
+  p <- ggplot(plot_data, aes(x = year, y = value, linetype = series)) +
+    geom_line(linewidth = 1) +
+    geom_point() +
+    scale_y_continuous(labels = comma) +
+    labs(
+      title = paste("Actual vs Forecast:", method_name),
+      x = "Year",
+      y = "Million TRY",
+      linetype = "Series"
+    )
+  
+  ggsave(
+    filename = paste0("outputs/figures/", filename),
+    plot = p,
+    width = 8,
+    height = 5
+  )
+  
+  p
+}
+```
+
+```{r method-plots}
+plot_forecast_method("Naive", "Naive Forecasting", "naive_forecast_plot.png")
+plot_forecast_method("Moving_Average", "Moving Average", "moving_average_plot.png")
+plot_forecast_method("Weighted_Moving_Average", "Weighted Moving Average", "weighted_moving_average_plot.png")
+plot_forecast_method("Exponential_Smoothing", "Exponential Smoothing", "exponential_smoothing_plot.png")
+plot_forecast_method("Trend_Adjusted_Exponential_Smoothing", "Trend-Adjusted Exponential Smoothing", "trend_adjusted_smoothing_plot.png")
+plot_forecast_method("Linear_Trend_Projection", "Linear Trend Projection", "trend_projection_plot.png")
+```
+
+# 12. Superior Method Selection
+
+```{r superior-method}
+superior_method <- accuracy_comparison_full %>%
+  filter(!is.na(MAPE)) %>%
+  arrange(MAPE, MAD) %>%
+  slice(1)
+
+superior_method %>%
+  kable(digits = 2)
+```
+
+The superior method is selected based on forecast accuracy and suitability to the structure of the selected series. Since total health expenditure has a strong upward annual trend and no monthly or quarterly seasonality, trend-sensitive forecasting methods are expected to be more suitable than purely level-based methods.
+
+The final selected method is:
+
+```{r selected-method-text}
+superior_method$Method
+```
+
+# 13. Final Forecast
+
+```{r final-forecast}
+final_forecast <- tibble(
+  Selected_Superior_Method = superior_method$Method,
+  Data_Access_Date = as.character(Sys.Date()),
+  Latest_Available_Observation = latest_year,
+  Forecast_Target_Period = forecast_target_year,
+  Forecasted_Value_Million_TRY = superior_method$Next_Period_Forecast,
+  MAPE = superior_method$MAPE,
+  MAD = superior_method$MAD,
+  MSE = superior_method$MSE
+)
+
+final_forecast %>%
+  kable(digits = 2)
+
+readr::write_csv(
+  final_forecast,
+  "outputs/tables/final_forecast.csv"
+)
+```
+
+```{r superior-method-plot}
+superior_column <- case_when(
+  superior_method$Method == "Naive Forecasting" ~ "Naive",
+  superior_method$Method == "Moving Average" ~ "Moving_Average",
+  superior_method$Method == "Weighted Moving Average" ~ "Weighted_Moving_Average",
+  superior_method$Method == "Exponential Smoothing" ~ "Exponential_Smoothing",
+  superior_method$Method == "Trend-Adjusted Exponential Smoothing" ~ "Trend_Adjusted_Exponential_Smoothing",
+  superior_method$Method == "Linear Trend Projection" ~ "Linear_Trend_Projection"
+)
+
+superior_plot_data <- forecast_results %>%
+  select(year, actual, forecast = all_of(superior_column)) %>%
+  tidyr::pivot_longer(
+    cols = c(actual, forecast),
+    names_to = "series",
+    values_to = "value"
+  )
+
+next_point <- tibble(
+  year = forecast_target_year,
+  series = "next_period_forecast",
+  value = superior_method$Next_Period_Forecast
+)
+
+superior_plot <- ggplot(superior_plot_data, aes(x = year, y = value, linetype = series)) +
+  geom_line(linewidth = 1) +
+  geom_point() +
+  geom_point(
+    data = next_point,
+    aes(x = year, y = value, linetype = series),
+    size = 3
+  ) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Superior Method and Next-Period Forecast",
+    x = "Year",
+    y = "Million TRY",
+    linetype = "Series"
+  )
+
+superior_plot
+
+ggsave(
+  filename = "outputs/figures/superior_method_plot.png",
+  plot = superior_plot,
+  width = 8,
+  height = 5
+)
+```
+
+# 14. Interpretation of Results
+
+The selected TÜİK variable represents total health expenditure in Türkiye, measured in million TRY. The series is suitable for forecasting because it is numerical, ordered by year, and observed repeatedly over a long time period.
+
+The time series displays a strong upward trend. This is expected because health expenditures tend to increase over time due to price increases, population dynamics, service expansion, and broader economic growth. Since the data are annual, there is no monthly or quarterly seasonal pattern to model.
+
+The superior method was selected by comparing the accuracy measures of the applicable forecasting methods. The final forecast represents the estimated total health expenditure for 2025, based on the latest available TÜİK observation for 2024.
+
+# 15. Limitations
+
+This analysis has several limitations. First, the data are annual, so the number of observations is limited compared with monthly data. Second, the series has a strong nominal upward trend, which may be affected by inflation and structural changes. Third, the analysis uses only historical values of health expenditures and does not include explanatory variables such as inflation, population, exchange rates, or policy changes. Finally, TÜİK data may be revised in future releases.
+
+# 16. Reproducibility Notes
+
+The data are accessed directly in R using `tuikr::statistical_tables("12")` and the corresponding TÜİK table URL. No manually downloaded, manually edited, or separately prepared data file is used.
+
+The project uses `renv` to record the package environment. Another user can restore the package environment by running:
+
+```{r restore-note, eval=FALSE}
+renv::restore()
+```
