@@ -104,7 +104,8 @@ To reproduce the project:
 1. Clone or download this repository.
 2. Open the project in RStudio.
 3. Restore the package environment if needed:
-
+```r
+renv::restore()
 ## 13. Repository Structure
 
 R_Based_Forecasting_Quant/
@@ -124,5 +125,3 @@ R_Based_Forecasting_Quant/
 - Student name: Burak Alper Kara
 - Student number: 138722517
 - Course name: Quantative Analysis
-```r
-renv::restore()
