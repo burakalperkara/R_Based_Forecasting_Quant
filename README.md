@@ -112,6 +112,7 @@ renv::restore()
 5. Click the **Knit** button to generate `forecasting_project.html`.
 ## 13. Repository Structure
 
+```text
 R_Based_Forecasting_Quant/
 ├── README.md
 ├── forecasting_project.Rmd
@@ -123,6 +124,7 @@ R_Based_Forecasting_Quant/
 │   └── figures/
 ├── renv.lock
 └── .gitignore
+```
 
 ## 14. Author
 
