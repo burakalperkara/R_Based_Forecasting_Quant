@@ -106,6 +106,10 @@ To reproduce the project:
 3. Restore the package environment if needed:
 ```r
 renv::restore()
+```
+
+4. Open `forecasting_project.Rmd`.
+5. Click the **Knit** button to generate `forecasting_project.html`.
 ## 13. Repository Structure
 
 R_Based_Forecasting_Quant/
