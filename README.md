@@ -129,5 +129,4 @@ R_Based_Forecasting_Quant/
 ## 14. Author
 
 - Student name: Burak Alper Kara
-- Student number: 138722517
 - Course name: Quantative Analysis
